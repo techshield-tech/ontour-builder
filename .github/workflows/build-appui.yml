@@ -1,6 +1,6 @@
 name: Build appui
 
-run-name: "appui @ ${{ inputs.ref || github.event.client_payload.ref || 'main' }} (${{ inputs.target || github.event.client_payload.target || 'apk' }})"
+run-name: "appui @ ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }} (${{ github.event.inputs.target || github.event.client_payload.target || 'apk' }})"
 
 on:
   workflow_dispatch:
@@ -10,9 +10,9 @@ on:
         required: true
         default: main
       target:
-        description: Loại output
+        description: "Output: apk | appbundle (Android) | ios (unsigned .ipa) | all (apk + ios)"
         type: choice
-        options: [apk, appbundle]
+        options: [apk, appbundle, ios, all]
         default: apk
   repository_dispatch:
     types: [build-appui]
@@ -20,7 +20,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: build-appui-${{ inputs.ref || github.event.client_payload.ref || 'main' }}
+  group: build-appui-${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}-${{ github.event.inputs.target || github.event.client_payload.target || 'apk' }}
   cancel-in-progress: true
 
 env:
@@ -30,12 +30,16 @@ env:
 
 jobs:
   build:
-    name: Build (private source, encrypted output)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.target == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON((github.event.inputs.target || github.event.client_payload.target) == 'all' && '["apk","ios"]' || format('["{0}"]', github.event.inputs.target || github.event.client_payload.target || 'apk')) }}
     env:
-      REF: ${{ inputs.ref || github.event.client_payload.ref || 'main' }}
-      TARGET: ${{ inputs.target || github.event.client_payload.target || 'apk' }}
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+      TARGET: ${{ matrix.target }}
 
     steps:
       - name: Validate inputs & secrets
@@ -50,7 +54,7 @@ jobs:
             if [ -z "${!s:-}" ]; then echo "::error::Thiếu secret $s"; missing=1; fi
           done
           if [ "${#ARTIFACT_PASSWORD}" -lt 16 ]; then echo "::error::ARTIFACT_PASSWORD phải >= 16 ký tự"; missing=1; fi
-          case "$TARGET" in apk|appbundle) ;; *) echo "::error::target không hợp lệ"; missing=1 ;; esac
+          case "$TARGET" in apk|appbundle|ios) ;; *) echo "::error::target không hợp lệ"; missing=1 ;; esac
           if ! [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "::error::ref không hợp lệ"; missing=1; fi
           exit $missing
 
@@ -61,7 +65,7 @@ jobs:
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
         run: |
           set -euo pipefail
-          auth=$(printf '%s:%s' "$GITEA_USERNAME" "$GITEA_TOKEN" | base64 -w0)
+          auth=$(printf '%s:%s' "$GITEA_USERNAME" "$GITEA_TOKEN" | base64 | tr -d '\n')
           echo "::add-mask::$auth"
           git init -q src
           cd src
@@ -71,6 +75,7 @@ jobs:
           echo "sha=$(git rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
+        if: matrix.target != 'ios'
         uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: temurin
@@ -92,12 +97,16 @@ jobs:
           set +e -uo pipefail
           mkdir -p ../out/symbols
           flutter config --no-analytics --no-cli-animations > /dev/null 2>&1 || true
+          common=(--release --build-number "$GITHUB_RUN_NUMBER" --obfuscate --split-debug-info=../out/symbols)
           {
             flutter --version
+            [ "$TARGET" = ios ] && xcodebuild -version
             flutter pub get
-            flutter build "$TARGET" --release \
-              --build-number "$GITHUB_RUN_NUMBER" \
-              --obfuscate --split-debug-info=../out/symbols
+            if [ "$TARGET" = ios ]; then
+              flutter build ios --no-codesign "${common[@]}"
+            else
+              flutter build "$TARGET" "${common[@]}"
+            fi
           } > ../out/build.log 2>&1
           rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
@@ -114,10 +123,18 @@ jobs:
           for f in src/build/app/outputs/flutter-apk/app-release.apk src/build/app/outputs/bundle/release/*.aab; do
             cp "$f" out/
           done
+          if [ -d src/build/ios/iphoneos/Runner.app ]; then
+            mkdir -p ipa/Payload
+            cp -R src/build/ios/iphoneos/Runner.app ipa/Payload/
+            (cd ipa && zip -qry ../out/appui-unsigned.ipa Payload)
+          fi
+          if command -v 7z > /dev/null; then Z=7z
+          elif command -v 7zz > /dev/null; then Z=7zz
+          else brew install -q sevenzip > /dev/null; Z=7zz; fi
           name="appui-${SHA}-${TARGET}-${GITHUB_RUN_NUMBER}"
-          7z a -t7z -mhe=on -mx=5 -p"$ARTIFACT_PASSWORD" "${name}.7z" ./out/* > /dev/null
+          "$Z" a -t7z -mhe=on -mx=5 -p"$ARTIFACT_PASSWORD" "${name}.7z" ./out/* > /dev/null
           echo "ARCHIVE=${name}" >> "$GITHUB_ENV"
-          rm -rf src out
+          rm -rf src out ipa
 
       - name: Upload encrypted artifact
         if: always() && env.ARCHIVE != ''
@@ -136,7 +153,7 @@ jobs:
           RC: ${{ steps.build.outputs.rc }}
         run: |
           {
-            echo "### appui build"
+            echo "### appui build — $TARGET"
             echo "| ref | commit | target | result |"
             echo "|---|---|---|---|"
             echo "| \`$REF\` | \`${SHA:-?}\` | $TARGET | $([ "${RC:-1}" = 0 ] && echo ✅ || echo ❌) |"
