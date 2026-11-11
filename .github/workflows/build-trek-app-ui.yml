@@ -1,0 +1,190 @@
+name: Build trek-app-ui
+
+run-name: "trek-app-ui @ ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }} (${{ github.event.inputs.target || github.event.client_payload.target || 'apk' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch / tag / commit SHA trên git.techshield.vn/ts-outsite/trek-app-ui
+        required: true
+        default: main
+      sdk_ref:
+        description: Branch / tag / commit SHA trên git.techshield.vn/ts-outsite/maps-flutter-sdk
+        required: true
+        default: master
+      target:
+        description: "Output: apk | appbundle (Android) | ios (unsigned .ipa) | all (apk + ios)"
+        type: choice
+        options: [apk, appbundle, ios, all]
+        default: apk
+  repository_dispatch:
+    types: [build-trek-app-ui]
+
+permissions: {}
+
+concurrency:
+  group: build-trek-app-ui-${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}-${{ github.event.inputs.target || github.event.client_payload.target || 'apk' }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_URL: https://git.techshield.vn/ts-outsite/trek-app-ui.git
+  SDK_URL: https://git.techshield.vn/ts-outsite/maps-flutter-sdk.git
+  API_BASE_URL: https://trek-api.mmoall.com
+  MAP_BASE_URL: https://api-maps.mmoall.com
+  FLUTTER_VERSION: 3.44.8
+  RETENTION_DAYS: 7
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.target == 'ios' && 'macos-latest' || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON((github.event.inputs.target || github.event.client_payload.target) == 'all' && '["apk","ios"]' || format('["{0}"]', github.event.inputs.target || github.event.client_payload.target || 'apk')) }}
+    env:
+      REF: ${{ github.event.inputs.ref || github.event.client_payload.ref || 'main' }}
+      SDK_REF: ${{ github.event.inputs.sdk_ref || github.event.client_payload.sdk_ref || 'master' }}
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Validate inputs & secrets
+        env:
+          GITEA_USERNAME: ${{ secrets.GITEA_USERNAME }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+          TREK_MAP_API_KEY: ${{ secrets.TREK_MAP_API_KEY }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for s in GITEA_USERNAME GITEA_TOKEN ARTIFACT_PASSWORD TREK_MAP_API_KEY; do
+            if [ -z "${!s:-}" ]; then echo "::error::Thiếu secret $s"; missing=1; fi
+          done
+          if [ "${#ARTIFACT_PASSWORD}" -lt 16 ]; then echo "::error::ARTIFACT_PASSWORD phải >= 16 ký tự"; missing=1; fi
+          case "$TREK_MAP_API_KEY" in tsk_?*) ;; *) echo "::error::TREK_MAP_API_KEY phải bắt đầu bằng tsk_"; missing=1 ;; esac
+          case "$TARGET" in apk|appbundle|ios) ;; *) echo "::error::target không hợp lệ"; missing=1 ;; esac
+          for r in "$REF" "$SDK_REF"; do
+            if ! [[ "$r" =~ ^[A-Za-z0-9._/-]+$ ]]; then echo "::error::ref không hợp lệ: $r"; missing=1; fi
+          done
+          exit $missing
+
+      # pubspec dùng `techshield_map: path: ../maps-flutter-sdk` nên SDK được đặt cạnh src.
+      - name: Fetch private source
+        id: src
+        env:
+          GITEA_USERNAME: ${{ secrets.GITEA_USERNAME }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          auth=$(printf '%s:%s' "$GITEA_USERNAME" "$GITEA_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$auth"
+          fetch() {
+            git init -q "$1"
+            git -C "$1" -c http.extraHeader="Authorization: Basic $auth" \
+              fetch -q --depth 1 --no-tags "$2" "$3"
+            git -C "$1" -c advice.detachedHead=false checkout -q FETCH_HEAD
+          }
+          fetch src "$SOURCE_URL" "$REF"
+          fetch maps-flutter-sdk "$SDK_URL" "$SDK_REF"
+          echo "sha=$(git -C src rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sdk_sha=$(git -C maps-flutter-sdk rev-parse --short=10 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        if: matrix.target != 'ios'
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+
+      # Toàn bộ output build (có thể chứa đoạn source khi lỗi compile) chỉ ghi vào file,
+      # file này nằm trong archive mã hoá — log public chỉ hiện pass/fail.
+      - name: Build (output hidden)
+        id: build
+        working-directory: src
+        env:
+          TREK_MAP_API_KEY: ${{ secrets.TREK_MAP_API_KEY }}
+          GOOGLE_SERVER_CLIENT_ID: ${{ secrets.TREK_GOOGLE_SERVER_CLIENT_ID }}
+        run: |
+          set +e -uo pipefail
+          mkdir -p ../out/symbols
+          flutter config --no-analytics --no-cli-animations > /dev/null 2>&1 || true
+          common=(--release --build-number "$GITHUB_RUN_NUMBER" --obfuscate --split-debug-info=../out/symbols
+            --dart-define=API_BASE_URL="$API_BASE_URL"
+            --dart-define=MAP_BASE_URL="$MAP_BASE_URL"
+            --dart-define=MAP_API_KEY="$TREK_MAP_API_KEY")
+          if [ -n "${GOOGLE_SERVER_CLIENT_ID:-}" ]; then
+            common+=(--dart-define=GOOGLE_SERVER_CLIENT_ID="$GOOGLE_SERVER_CLIENT_ID")
+          fi
+          {
+            flutter --version
+            [ "$TARGET" = ios ] && xcodebuild -version
+            flutter pub get
+            if [ "$TARGET" = ios ]; then
+              flutter build ios --no-codesign "${common[@]}"
+            else
+              flutter build "$TARGET" "${common[@]}"
+            fi
+          } > ../out/build.log 2>&1
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ $rc -eq 0 ]; then echo "Build OK"; else echo "::error::Build failed (exit $rc) — xem build.log trong artifact mã hoá"; fi
+
+      - name: Package & encrypt
+        if: always() && steps.src.outcome == 'success'
+        env:
+          ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+          SHA: ${{ steps.src.outputs.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in src/build/app/outputs/flutter-apk/app-release.apk src/build/app/outputs/bundle/release/*.aab; do
+            [ -f "$f" ] && cp "$f" out/
+          done
+          if [ -d src/build/ios/iphoneos/Runner.app ]; then
+            mkdir -p ipa/Payload
+            cp -R src/build/ios/iphoneos/Runner.app ipa/Payload/
+            (cd ipa && zip -qry ../out/trek-app-ui-unsigned.ipa Payload)
+          fi
+          if command -v 7z > /dev/null; then Z=7z
+          elif command -v 7zz > /dev/null; then Z=7zz
+          else brew install -q sevenzip > /dev/null; Z=7zz; fi
+          name="trek-app-ui-${SHA}-${TARGET}-${GITHUB_RUN_NUMBER}"
+          "$Z" a -t7z -mhe=on -mx=5 -p"$ARTIFACT_PASSWORD" "${name}.7z" ./out/* > /dev/null
+          echo "ARCHIVE=${name}" >> "$GITHUB_ENV"
+          rm -rf src maps-flutter-sdk out ipa
+
+      - name: Upload encrypted artifact
+        if: always() && env.ARCHIVE != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}.7z
+          compression-level: 0
+          retention-days: ${{ env.RETENTION_DAYS }}
+          if-no-files-found: error
+
+      - name: Summary
+        if: always()
+        env:
+          SHA: ${{ steps.src.outputs.sha }}
+          SDK_SHA: ${{ steps.src.outputs.sdk_sha }}
+          RC: ${{ steps.build.outputs.rc }}
+        run: |
+          {
+            echo "### trek-app-ui build — $TARGET"
+            echo "| ref | commit | sdk commit | API | Map API | target | result |"
+            echo "|---|---|---|---|---|---|---|"
+            echo "| \`$REF\` | \`${SHA:-?}\` | \`${SDK_SHA:-?}\` | $API_BASE_URL | $MAP_BASE_URL | $TARGET | $([ "${RC:-1}" = 0 ] && echo ✅ || echo ❌) |"
+            echo
+            echo "Artifact mã hoá AES-256 (7z, ẩn cả tên file). Giải nén: \`7z x <file>.7z -p<ARTIFACT_PASSWORD>\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "${RC:-1}" = 0 ]
